@@ -35,49 +35,85 @@ fit_garch_model <- function(returns, dist_model, model_type = "sGARCH") {
   return(garch_fit)
 }
 
-# Function to calculate VaR for different distributions
-calculate_var <- function(garch_fit, dist_type, confidence_level) {
+# Function to calculate VaR and ES for different distributions
+calculate_var_es <- function(garch_fit, dist_type, confidence_level) {
   sigma <- garch_fit@fit$sigma
   resid <- residuals(garch_fit, standardize = TRUE)
   alpha <- 1 - confidence_level
   
+  # Helper function to calculate ES using numerical integration
+  calculate_es_numeric <- function(alpha, pdf_func, quantile_val, params) {
+    # ES = E[X | X < VaR] for the distribution
+    integrand <- function(p) {
+      do.call(pdf_func, c(list(p), params))
+    }
+    
+    if (alpha > 0) {
+      es_quantile <- integrate(integrand, lower = 0, upper = alpha)$value / alpha
+    } else {
+      es_quantile <- quantile_val
+    }
+    return(es_quantile)
+  }
+  
   if (dist_type == "norm") {
     quantile_val <- qnorm(alpha, mean = 0, sd = 1)
+    # Analytical ES for normal distribution
+    es_quantile <- -dnorm(qnorm(alpha)) / alpha
+    
   } else if (dist_type == "std") {
     fit_params <- stdFit(resid)
     nu <- fit_params$par[3]
     quantile_val <- qstd(alpha, mean = 0, sd = 1, nu = nu)
+    # Analytical ES for Student-t
+    es_quantile <- -dstd(quantile_val, mean = 0, sd = 1, nu = nu) / alpha * 
+                   (nu + quantile_val^2) / (nu - 1)
+    
   } else if (dist_type == "ged") {
     fit_params <- gedFit(resid)
     nu <- fit_params$par[3]
     quantile_val <- qged(alpha, mean = 0, sd = 1, nu = nu)
+    es_quantile <- calculate_es_numeric(alpha, qged, quantile_val, 
+                                       list(mean = 0, sd = 1, nu = nu))
+    
   } else if (dist_type == "snorm") {
     fit_params <- snormFit(resid)
     xi <- fit_params$par[3]
     quantile_val <- qsnorm(alpha, mean = 0, sd = 1, xi = xi)
+    es_quantile <- calculate_es_numeric(alpha, qsnorm, quantile_val,
+                                       list(mean = 0, sd = 1, xi = xi))
+    
   } else if (dist_type == "sstd") {
     fit_params <- sstdFit(resid)
     nu <- fit_params$estimate[3]
     xi <- fit_params$estimate[4]
     quantile_val <- qsstd(alpha, mean = 0, sd = 1, nu = nu, xi = xi)
+    es_quantile <- calculate_es_numeric(alpha, qsstd, quantile_val,
+                                       list(mean = 0, sd = 1, nu = nu, xi = xi))
+    
   } else if (dist_type == "sged") {
     fit_params <- sgedFit(resid)
     nu <- fit_params$par[3]
     xi <- fit_params$par[4]
     quantile_val <- qsged(alpha, mean = 0, sd = 1, nu = nu, xi = xi)
+    es_quantile <- calculate_es_numeric(alpha, qsged, quantile_val,
+                                       list(mean = 0, sd = 1, nu = nu, xi = xi))
   }
   
   var <- -sigma * quantile_val
-  return(var)
+  es <- -sigma * es_quantile
+  
+  return(list(var = var, es = es))
 }
 
 # Function to calculate backtesting metrics
-calculate_backtesting_metrics <- function(returns, var, confidence_level, portfolio_val) {
+calculate_backtesting_metrics <- function(returns, var, es, confidence_level, portfolio_val) {
   # Calculate actual losses
   actual_losses <- -returns * portfolio_val
   
-  # Calculate VaR in monetary terms
+  # Calculate VaR and ES in monetary terms
   var_monetary <- var * portfolio_val
+  es_monetary <- es * portfolio_val
   
   # Identify breaches (when actual loss exceeds VaR)
   breaches <- actual_losses > var_monetary
@@ -92,18 +128,30 @@ calculate_backtesting_metrics <- function(returns, var, confidence_level, portfo
   # Calculate extra capital (average VaR)
   extra_capital <- mean(var_monetary)
   
+  # Calculate average ES
+  avg_es <- mean(es_monetary)
+  
   # Calculate extra losses (losses beyond VaR when breaches occur)
   extra_losses_per_breach <- actual_losses[breaches] - var_monetary[breaches]
   total_extra_losses <- sum(extra_losses_per_breach)
   avg_extra_loss <- ifelse(num_breaches > 0, mean(extra_losses_per_breach), 0)
+  
+  # ES backtesting - calculate actual average loss in tail
+  actual_es <- ifelse(num_breaches > 0, mean(actual_losses[breaches]), 0)
+  
+  # ES coverage ratio - how well ES predicts tail losses
+  es_coverage <- ifelse(avg_es > 0, actual_es / avg_es, 0)
   
   return(list(
     num_breaches = num_breaches,
     breach_rate = breach_rate,
     expected_breach_rate = expected_breach_rate,
     extra_capital = extra_capital,
+    avg_es = avg_es,
     total_extra_losses = total_extra_losses,
-    avg_extra_loss = avg_extra_loss
+    avg_extra_loss = avg_extra_loss,
+    actual_es = actual_es,
+    es_coverage = es_coverage
   ))
 }
 
@@ -112,8 +160,9 @@ backtest_model <- function(returns, garch_fit, dist_type, model_name, portfolio_
   results_list <- list()
   
   for (conf_level in confidence_levels) {
-    var <- calculate_var(garch_fit, dist_type, conf_level)
-    metrics <- calculate_backtesting_metrics(returns, var, conf_level, portfolio_val)
+    risk_measures <- calculate_var_es(garch_fit, dist_type, conf_level)
+    metrics <- calculate_backtesting_metrics(returns, risk_measures$var, risk_measures$es, 
+                                             conf_level, portfolio_val)
     
     results_list[[as.character(conf_level)]] <- data.frame(
       Model = model_name,
@@ -123,8 +172,11 @@ backtest_model <- function(returns, garch_fit, dist_type, model_name, portfolio_
       Breach_Rate = metrics$breach_rate,
       Expected_Breach_Rate = metrics$expected_breach_rate,
       Extra_Capital = metrics$extra_capital,
+      Avg_ES = metrics$avg_es,
       Total_Extra_Losses = metrics$total_extra_losses,
       Avg_Extra_Loss = metrics$avg_extra_loss,
+      Actual_ES = metrics$actual_es,
+      ES_Coverage_Ratio = metrics$es_coverage,
       stringsAsFactors = FALSE
     )
   }
@@ -286,8 +338,11 @@ for (conf in confidence_levels) {
     Expected_Breach_Rate = best_model$Expected_Breach_Rate,
     Breach_Deviation = best_model$Breach_Deviation,
     Extra_Capital = best_model$Extra_Capital,
+    Avg_ES = best_model$Avg_ES,
     Total_Extra_Losses = best_model$Total_Extra_Losses,
-    Avg_Extra_Loss = best_model$Avg_Extra_Loss
+    Avg_Extra_Loss = best_model$Avg_Extra_Loss,
+    Actual_ES = best_model$Actual_ES,
+    ES_Coverage_Ratio = best_model$ES_Coverage_Ratio
   ))
 }
 
